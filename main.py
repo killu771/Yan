@@ -239,6 +239,7 @@ class VertexAIClient:
                     "message": {
                         "role": "assistant",
                         "content": final_content
+                        "reasoning_content": reasoning_content if reasoning_content else None
                     },
                     "finish_reason": finish_reason
                 }
@@ -1192,6 +1193,7 @@ if __name__ == "__main__":
             print("⚠️ GUI dependencies not found or failed. Falling back to headless mode.")
 
             asyncio.run(main())
+
 
 
 
