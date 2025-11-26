@@ -177,79 +177,79 @@ class VertexAIClient:
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
         self.client = httpx.AsyncClient(timeout=120.0, limits=limits)
 
-async def complete_chat(self, messages: List[Dict[str, str]], model: str, **kwargs) -> Dict[str, Any]:
-    """Aggregates the streaming response into a single non-streaming ChatCompletion object."""
-    
-    full_content = ""
-    reasoning_content = ""
-    finish_reason = "stop"
-    
-    # Use the existing streaming logic to get chunks
-    async for chunk_data_sse in self.stream_chat(messages, model, **kwargs):
-        # SSE format: "data: {json_chunk}\n\n"
-        if chunk_data_sse.startswith("data: "):
-            json_str = chunk_data_sse[6:].strip()
-            if json_str == "[DONE]":
-                continue
-            
-            try:
-                chunk = json.loads(json_str)
-                choices = chunk.get('choices', [])
-                if choices:
-                    delta = choices[0].get('delta', {})
-                    
-                    # Aggregate content
-                    if 'content' in delta:
-                        full_content += delta['content']
-                    if 'reasoning_content' in delta:
-                        reasoning_content += delta['reasoning_content']
-                        
-                    # Capture finish reason from the last chunk
-                    if choices[0].get('finish_reason'):
-                        finish_reason = choices[0]['finish_reason']
-                        
-            except json.JSONDecodeError as e:
-                print(f"Error decoding JSON chunk in complete_chat: {e}")
-                # Continue to next chunk
-                
-    # Construct the final non-streaming response
-    # 直接使用 content，不包裹标签
-    final_content = full_content
-    
-    # Workaround for clients that treat empty content as failure
-    if not final_content:
-        final_content = " "
-    
-    # 构建消息对象，只在有 reasoning_content 时添加该字段
-    message_obj = {
-        "role": "assistant",
-        "content": final_content
-    }
-    
-    # 只在有思维链内容时才添加 reasoning_content 字段
-    if reasoning_content:
-        message_obj["reasoning_content"] = reasoning_content
+    async def complete_chat(self, messages: List[Dict[str, str]], model: str, **kwargs) -> Dict[str, Any]:
+        """Aggregates the streaming response into a single non-streaming ChatCompletion object."""
         
-    response = {
-        "id": f"chatcmpl-proxy-nonstream-{uuid.uuid4()}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
-        },
-        "choices": [
-            {
-                "index": 0,
-                "message": message_obj,
-                "finish_reason": finish_reason
-            }
-        ]
-    }
-    return response
-
+        full_content = ""
+        reasoning_content = ""
+        finish_reason = "stop"
+        
+        # Use the existing streaming logic to get chunks
+        async for chunk_data_sse in self.stream_chat(messages, model, **kwargs):
+            # SSE format: "data: {json_chunk}\n\n"
+            if chunk_data_sse.startswith("data: "):
+                json_str = chunk_data_sse[6:].strip()
+                if json_str == "[DONE]":
+                    continue
+                
+                try:
+                    chunk = json.loads(json_str)
+                    choices = chunk.get('choices', [])
+                    if choices:
+                        delta = choices[0].get('delta', {})
+                        
+                        # Aggregate content
+                        if 'content' in delta:
+                            full_content += delta['content']
+                        if 'reasoning_content' in delta:
+                            reasoning_content += delta['reasoning_content']
+                            
+                        # Capture finish reason from the last chunk
+                        if choices[0].get('finish_reason'):
+                            finish_reason = choices[0]['finish_reason']
+                            
+                except json.JSONDecodeError as e:
+                    print(f"Error decoding JSON chunk in complete_chat: {e}")
+                    # Continue to next chunk
+                    
+        # Construct the final non-streaming response
+        # 直接使用 content，不包裹标签
+        final_content = full_content
+        
+        # Workaround for clients that treat empty content as failure
+        if not final_content:
+            final_content = " "
+        
+        # 构建消息对象，只在有 reasoning_content 时添加该字段
+        message_obj = {
+            "role": "assistant",
+            "content": final_content
+        }
+        
+        # 只在有思维链内容时才添加 reasoning_content 字段
+        if reasoning_content:
+            message_obj["reasoning_content"] = reasoning_content
+            
+        response = {
+            "id": f"chatcmpl-proxy-nonstream-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            },
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message_obj,
+                    "finish_reason": finish_reason
+                }
+            ]
+        }
+        return response
+        
     async def stream_chat(self, messages: List[Dict[str, str]], model: str, **kwargs):
         # 1. Check Credential Freshness & Auto-Refresh
         # Vertex AI tokens typically last 1 hour. We'll refresh if older than 50 mins.
@@ -1196,6 +1196,7 @@ if __name__ == "__main__":
             print("⚠️ GUI dependencies not found or failed. Falling back to headless mode.")
 
             asyncio.run(main())
+
 
 
 
