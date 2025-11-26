@@ -215,11 +215,9 @@ class VertexAIClient:
         # Construct the final non-streaming response
         # Note: We are not calculating token usage here, as that requires more complex logic
         # and is usually done by the upstream API. We will use placeholders.
-        
-        # Combine reasoning and content if reasoning exists
+
+        # 直接使用 content，不包裹标签
         final_content = full_content
-        if reasoning_content:
-            final_content = f"<think>\n{reasoning_content}\n</think>\n\n{full_content}"
         
         # Workaround for clients that treat empty content as failure
         if not final_content:
@@ -1194,5 +1192,6 @@ if __name__ == "__main__":
             print("⚠️ GUI dependencies not found or failed. Falling back to headless mode.")
 
             asyncio.run(main())
+
 
 
