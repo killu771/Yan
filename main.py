@@ -773,12 +773,14 @@ class VertexAIClient:
                                 delta = {}
                                 # --- Text Part ---
                                 text = part.get('text', '')
-                                if text:
+                                       if text:
                                     # 1. Explicit Thought (Legacy/Standard)
                                     if part.get('thought', False):
                                         delta['reasoning_content'] = text
-                                                                    # 2. Implicit Thought (Gemini 3 Pro) - Universal Title Support
-                                elif state and "gemini-3-pro" in model and not state.get('finished_thinking'):
+                                    
+                                    # 2. Implicit Thought (Gemini 3 Pro) - Universal Title Support
+                                    elif state and "gemini-3-pro" in model and not state.get('finished_thinking'):
+
                                     state['buffer'] += text
                                     
                                     # --- 阶段 1: 初始检测 (判断是否进入思维模式) ---
@@ -844,10 +846,12 @@ class VertexAIClient:
                                             # 继续等待下一块数据
                                             continue 
                                     
-                                    # --- 阶段 3: 正文流式处理 ---
-                                    elif state['finished_thinking']:
-                                        delta['content'] = state['buffer']
-                                        state['buffer'] = ""
+                                     # 3. 普通文本
+                                    else:
+                                        delta['content'] = text
+    
+                                # --- Image Part (inline data) ---
+
 
     
                                 # --- Image Part (inline data) ---
@@ -1208,3 +1212,4 @@ if __name__ == "__main__":
             print("⚠️ GUI dependencies not found or failed. Falling back to headless mode.")
 
             asyncio.run(main())
+
