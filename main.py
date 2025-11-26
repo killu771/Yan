@@ -773,85 +773,67 @@ class VertexAIClient:
                                 delta = {}
                                 # --- Text Part ---
                                 text = part.get('text', '')
-                                       if text:
+                                if text:
                                     # 1. Explicit Thought (Legacy/Standard)
                                     if part.get('thought', False):
                                         delta['reasoning_content'] = text
                                     
                                     # 2. Implicit Thought (Gemini 3 Pro) - Universal Title Support
                                     elif state and "gemini-3-pro" in model and not state.get('finished_thinking'):
-
-                                    state['buffer'] += text
-                                    
-                                    # --- 阶段 1: 初始检测 (判断是否进入思维模式) ---
-                                    if state['first_chunk']:
-                                        # 只要缓冲区足够长，且以 "**" 开头，就视为进入了带标题的思维链模式
-                                        # 这样可以适配 "**Reasoning:**", "**Analysis:**" 等各种标题
-                                        if len(state['buffer']) < 5: 
-                                            continue # 数据太短，等待下一块
+                                        state['buffer'] += text
                                         
-                                        clean_buffer = state['buffer'].strip()
-                                        if clean_buffer.startswith('**'):
-                                            state['in_thought'] = True
-                                        else:
-                                            # 如果开头不是粗体，说明没有思维链，直接当作正文
-                                            state['finished_thinking'] = True
+                                        # --- 阶段 1: 初始检测 ---
+                                        if state['first_chunk']:
+                                            if len(state['buffer']) < 5: 
+                                                continue
+                                            
+                                            clean_buffer = state['buffer'].strip()
+                                            if clean_buffer.startswith('**'):
+                                                state['in_thought'] = True
+                                            else:
+                                                state['finished_thinking'] = True
+                                                delta['content'] = state['buffer']
+                                                state['buffer'] = ""
+                                            
+                                            state['first_chunk'] = False
+                                        
+                                        # --- 阶段 2: 思维链流式处理 ---
+                                        if state['in_thought']:
+                                            import re
+                                            response_pattern = r'\n\s*\*\*Response:?\*\*'
+                                            match = re.search(response_pattern, state['buffer'], re.IGNORECASE)
+                                            
+                                            if match:
+                                                end_idx = match.start()
+                                                content_start_idx = match.end()
+                                                
+                                                thought_content = state['buffer'][:end_idx]
+                                                if thought_content:
+                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': thought_content}, 'finish_reason': None}]})}\n\n"
+                                                
+                                                real_content = state['buffer'][content_start_idx:].lstrip()
+                                                if real_content:
+                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'content': real_content}, 'finish_reason': None}]})}\n\n"
+                                                
+                                                state['buffer'] = ""
+                                                state['in_thought'] = False
+                                                state['finished_thinking'] = True
+                                            else:
+                                                safe_threshold = 30
+                                                if len(state['buffer']) > safe_threshold:
+                                                    chunk_text = state['buffer'][:-safe_threshold]
+                                                    state['buffer'] = state['buffer'][-safe_threshold:]
+                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': chunk_text}, 'finish_reason': None}]})}\n\n"
+                                                continue
+                                        
+                                        # --- 阶段 3: 正文流式处理 ---
+                                        elif state['finished_thinking']:
                                             delta['content'] = state['buffer']
                                             state['buffer'] = ""
-                                        
-                                        state['first_chunk'] = False
                                     
-                                    # --- 阶段 2: 思维链流式处理 (寻找 **Response:** 锚点) ---
-                                    if state['in_thought']:
-                                        import re
-                                        # 使用正则寻找切分点：换行 + 任意空白 + **Response + 可选冒号 + **
-                                        # re.IGNORECASE 确保能匹配 RESPONSE/Response
-                                        response_pattern = r'\n\s*\*\*Response:?\*\*'
-                                        
-                                        match = re.search(response_pattern, state['buffer'], re.IGNORECASE)
-                                        
-                                        if match:
-                                            # >>> 找到了切换点！<<<
-                                            end_idx = match.start()
-                                            content_start_idx = match.end()
-                                            
-                                            # 1. 之前的所有内容都是思维链 (reasoning_content)
-                                            thought_content = state['buffer'][:end_idx]
-                                            if thought_content:
-                                                 yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': thought_content}, 'finish_reason': None}]})}\n\n"
-                                            
-                                            # 2. 之后的所有内容都是正文 (content)
-                                            # lstrip() 去掉 **Response:** 后面紧跟的换行符
-                                            real_content = state['buffer'][content_start_idx:].lstrip()
-                                            if real_content:
-                                                yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'content': real_content}, 'finish_reason': None}]})}\n\n"
-                                            
-                                            # 3. 更新状态
-                                            state['buffer'] = ""
-                                            state['in_thought'] = False
-                                            state['finished_thinking'] = True
-                                            
-                                        else:
-                                            # >>> 还没找到切换点，继续流式传输思维链 <<<
-                                            # 保留缓冲区末尾 30 个字符，防止切断 "**Response:**" 标签
-                                            safe_threshold = 30
-                                            
-                                            if len(state['buffer']) > safe_threshold:
-                                                # 把安全部分先发出去
-                                                chunk_text = state['buffer'][:-safe_threshold]
-                                                state['buffer'] = state['buffer'][-safe_threshold:]
-                                                
-                                                yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': chunk_text}, 'finish_reason': None}]})}\n\n"
-                                            
-                                            # 继续等待下一块数据
-                                            continue 
-                                    
-                                     # 3. 普通文本
+                                    # 3. 普通文本
                                     else:
                                         delta['content'] = text
-    
-                                # --- Image Part (inline data) ---
-
 
     
                                 # --- Image Part (inline data) ---
@@ -1212,4 +1194,5 @@ if __name__ == "__main__":
             print("⚠️ GUI dependencies not found or failed. Falling back to headless mode.")
 
             asyncio.run(main())
+
 
