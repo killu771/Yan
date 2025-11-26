@@ -293,6 +293,14 @@ class VertexAIClient:
         max_retries = 1
         content_yielded = False # Track if any content chunk was yielded
         
+        # Initialize state for Gemini 3 Pro thinking parsing
+        parse_state = {
+            "buffer": "",
+            "in_thought": False,
+            "finished_thinking": False,
+            "first_chunk": True
+        }
+
         for attempt in range(max_retries + 1):
             
             creds = cred_manager.get_credentials()
@@ -625,7 +633,7 @@ class VertexAIClient:
                                 decoder = json.JSONDecoder()
                                 obj, idx = decoder.raw_decode(buffer)
                                 
-                                for chunk_data in self.process_google_response(obj):
+                                for chunk_data in self.process_google_response(obj, model, parse_state):
                                     yield chunk_data
                                     content_yielded = True # Mark that content was successfully yielded
                                 
@@ -712,18 +720,27 @@ class VertexAIClient:
             # If the stream finished but yielded no content, log a warning.
             # We rely on the client to handle the empty stream gracefully after receiving [DONE].
             print("⚠️ Proxy Warning: Google API returned an empty stream (200 OK but no content).")
-            
+        
+        # Flush remaining buffer from parse_state
+        if parse_state['buffer']:
+            if parse_state['in_thought']:
+                # If we ended in thought, yield as reasoning
+                yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': parse_state['buffer']}, 'finish_reason': None}]})}\n\n"
+            else:
+                # Yield as content
+                yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'content': parse_state['buffer']}, 'finish_reason': None}]})}\n\n"
+
         # Ensure the stream is properly terminated with [DONE]
         yield "data: [DONE]\n\n"
 
-    def process_google_response(self, data: Dict[str, Any]) -> Generator[str, None, None]:
+    def process_google_response(self, data: Dict[str, Any], model: str = "", state: Dict[str, Any] = None) -> Generator[str, None, None]:
             """Converts Google's response format to OpenAI's SSE format, handling text and images."""
             try:
                 if not data:
                     return
                 
                 # Debug: Log the raw data received from Google
-                print(f"🔍 Google Raw Chunk: {json.dumps(data, indent=2)[:500]}...")
+                # print(f"🔍 Google Raw Chunk: {json.dumps(data, indent=2)[:500]}...")
     
                 if 'error' in data:
                     print(f"⚠️ Google Stream Error: {data['error']}")
@@ -757,8 +774,69 @@ class VertexAIClient:
                                 # --- Text Part ---
                                 text = part.get('text', '')
                                 if text:
+                                    # 1. Explicit Thought (Legacy/Standard)
                                     if part.get('thought', False):
                                         delta['reasoning_content'] = text
+                                    
+                                    # 2. Implicit Thought (Gemini 3 Pro)
+                                    # Gemini 3 Pro Preview embeds thoughts in text with **Title** format
+                                    elif state and "gemini-3-pro" in model and not state.get('finished_thinking'):
+                                        state['buffer'] += text
+                                        
+                                        # Check start
+                                        if state['first_chunk']:
+                                            if len(state['buffer']) >= 2:
+                                                if state['buffer'].startswith('**'):
+                                                    state['in_thought'] = True
+                                                else:
+                                                    state['finished_thinking'] = True
+                                                    # Flush buffer as content
+                                                    delta['content'] = state['buffer']
+                                                    state['buffer'] = ""
+                                                state['first_chunk'] = False
+                                            else:
+                                                continue # Wait for more data
+                                        
+                                        if state['finished_thinking']:
+                                            delta['content'] = state['buffer']
+                                            state['buffer'] = ""
+                                        
+                                        elif state['in_thought']:
+                                            # Process buffer for thoughts
+                                            while True:
+                                                idx = state['buffer'].find('\n\n')
+                                                if idx == -1:
+                                                    break
+                                                
+                                                # Found a separator, check lookahead
+                                                if len(state['buffer']) < idx + 4:
+                                                    break # Wait for more
+                                                
+                                                # Check if next block is a thought header
+                                                next_block = state['buffer'][idx+2:]
+                                                if next_block.startswith('**'):
+                                                    # Still in thought
+                                                    chunk_text = state['buffer'][:idx+2]
+                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': chunk_text}, 'finish_reason': None}]})}\n\n"
+                                                    state['buffer'] = state['buffer'][idx+2:]
+                                                else:
+                                                    # Switch to content
+                                                    chunk_text = state['buffer'][:idx+2]
+                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': chunk_text}, 'finish_reason': None}]})}\n\n"
+                                                    state['buffer'] = state['buffer'][idx+2:]
+                                                    state['in_thought'] = False
+                                                    state['finished_thinking'] = True
+                                                    break
+                                            
+                                            # Yield remaining buffer as reasoning (safe part)
+                                            # We keep last 3 chars to handle split \n\n
+                                            if len(state['buffer']) > 3:
+                                                safe_chunk = state['buffer'][:-3]
+                                                yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': safe_chunk}, 'finish_reason': None}]})}\n\n"
+                                                state['buffer'] = state['buffer'][-3:]
+                                            
+                                            continue # Don't yield delta at the end, we yielded manually
+                                    
                                     else:
                                         delta['content'] = text
     
