@@ -783,7 +783,7 @@ class VertexAIClient:
                                         else:
                                             state['buffer'] += text
                                             
-                                            # A. Check for explicit delimiters
+                                            # A. Check for explicit delimiters (Fast Path)
                                             delimiters = ["**Response:**", "**Response**", "**Answer:**", "**Answer**"]
                                             found_delimiter = None
                                             split_idx = -1
@@ -810,46 +810,58 @@ class VertexAIClient:
                                                 state['buffer'] = ""
                                                 continue
 
-                                            # B. Optimization: Flush completed thought blocks (ending with \n\n**)
-                                            # This keeps the buffer small and focused on the current block.
-                                            # We look for \n\n followed by **.
-                                            # We use rfind to find the LAST occurrence to be safe, or find to flush incrementally?
-                                            # Let's find the first one to flush incrementally.
-                                            flush_idx = state['buffer'].find('\n\n**')
-                                            if flush_idx != -1:
-                                                # Yield everything up to the \n\n (inclusive)
-                                                to_yield = state['buffer'][:flush_idx+2]
-                                                state['buffer'] = state['buffer'][flush_idx+2:]
-                                                yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': to_yield}, 'finish_reason': None}]})}\n\n"
+                                            # B. Structural Heuristic: Detect transition from Thought to Response
+                                            # Thought steps are typically separated by \n\n and start with **Title**.
+                                            # If we find \n\n followed by text that is NOT a header, it's likely the response.
                                             
-                                            # C. Heuristic: "Structuring the Final Answer"
-                                            # If we are in the final thought step, and we see a double newline followed by non-bold text, it's likely the response.
-                                            if "**Structuring the Final Answer**" in state['buffer']:
-                                                # Look for \n\n
-                                                # We need to check if what follows is NOT starting with **
-                                                # Since we flushed previous blocks in step B, the buffer should start with "**Structuring..."
+                                            while True:
+                                                # Find potential block separator
+                                                idx = state['buffer'].find('\n\n')
+                                                if idx == -1:
+                                                    break
+                                                    
+                                                # We have a separator. Check what follows.
+                                                # We need enough lookahead to determine if it's a header.
+                                                # Find the next newline after \n\n to get the full line
+                                                next_newline = state['buffer'].find('\n', idx + 2)
                                                 
-                                                nl_idx = state['buffer'].find('\n\n')
-                                                if nl_idx != -1:
-                                                    following_text = state['buffer'][nl_idx+2:]
-                                                    # Need enough chars to check for **
-                                                    if len(following_text) >= 2:
-                                                        if not following_text.strip().startswith('**'):
-                                                            # Heuristic Triggered: Switch to content
-                                                            thought_part = state['buffer'][:nl_idx+2]
-                                                            content_part = state['buffer'][nl_idx+2:]
-                                                            
-                                                            yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': thought_part}, 'finish_reason': None}]})}\n\n"
-                                                            yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'content': content_part}, 'finish_reason': None}]})}\n\n"
-                                                            
-                                                            state['finished_thinking'] = True
-                                                            state['buffer'] = ""
-                                                            continue
+                                                # If we don't have a full line yet, and buffer isn't huge, wait for more data.
+                                                if next_newline == -1:
+                                                    if len(state['buffer']) - idx < 100: # Wait for up to 100 chars of lookahead
+                                                        break
+                                                    else:
+                                                        # If line is super long, it's probably not a header. Treat as response.
+                                                        next_line = state['buffer'][idx+2:]
+                                                else:
+                                                    next_line = state['buffer'][idx+2 : next_newline].strip()
+                                                
+                                                # Check if next_line looks like a header
+                                                # Header criteria: Starts with **, Ends with **, Short length
+                                                is_header = next_line.startswith('**') and next_line.endswith('**') and len(next_line) < 80
+                                                
+                                                if is_header:
+                                                    # It is a header. New Thought Step.
+                                                    # Yield everything up to idx+2 as reasoning.
+                                                    to_yield = state['buffer'][:idx+2]
+                                                    state['buffer'] = state['buffer'][idx+2:]
+                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': to_yield}, 'finish_reason': None}]})}\n\n"
+                                                    # Continue loop to find next block in the remaining buffer
+                                                else:
+                                                    # It is NOT a header. This is the Response.
+                                                    # Yield everything up to idx+2 as reasoning.
+                                                    thought_part = state['buffer'][:idx+2]
+                                                    content_part = state['buffer'][idx+2:]
+                                                    
+                                                    if thought_part:
+                                                        yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': thought_part}, 'finish_reason': None}]})}\n\n"
+                                                    
+                                                    if content_part:
+                                                        yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'content': content_part}, 'finish_reason': None}]})}\n\n"
+                                                    
+                                                    state['finished_thinking'] = True
+                                                    state['buffer'] = ""
+                                                    break # Exit loop
                                             
-                                            # D. Buffer Management
-                                            # If no delimiter/heuristic found, we must keep buffering.
-                                            # But we can't yield partial buffer safely if we are waiting for a delimiter that might appear.
-                                            # However, we flushed safe parts in Step B.
                                             continue
                                     
                                     else:
