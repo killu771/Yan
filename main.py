@@ -213,22 +213,15 @@ class VertexAIClient:
                     # Continue to next chunk
                     
         # Construct the final non-streaming response
-        # 直接使用 content，不包裹标签
+        # Note: We are not calculating token usage here, as that requires more complex logic
+        # and is usually done by the upstream API. We will use placeholders.
+        
+        # Combine reasoning and content if reasoning exists
         final_content = full_content
         
         # Workaround for clients that treat empty content as failure
         if not final_content:
             final_content = " "
-        
-        # 构建消息对象，只在有 reasoning_content 时添加该字段
-        message_obj = {
-            "role": "assistant",
-            "content": final_content
-        }
-        
-        # 只在有思维链内容时才添加 reasoning_content 字段
-        if reasoning_content:
-            message_obj["reasoning_content"] = reasoning_content
             
         response = {
             "id": f"chatcmpl-proxy-nonstream-{uuid.uuid4()}",
@@ -236,20 +229,24 @@ class VertexAIClient:
             "created": int(time.time()),
             "model": model,
             "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
+                "prompt_tokens": 0, # Placeholder
+                "completion_tokens": 0, # Placeholder
+                "total_tokens": 0 # Placeholder
             },
             "choices": [
                 {
                     "index": 0,
-                    "message": message_obj,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_content,
+                        "reasoning_content": reasoning_content
+                    },
                     "finish_reason": finish_reason
                 }
             ]
         }
         return response
-        
+
     async def stream_chat(self, messages: List[Dict[str, str]], model: str, **kwargs):
         # 1. Check Credential Freshness & Auto-Refresh
         # Vertex AI tokens typically last 1 hour. We'll refresh if older than 50 mins.
@@ -725,12 +722,9 @@ class VertexAIClient:
         
         # Flush remaining buffer from parse_state
         if parse_state['buffer']:
-            if parse_state['in_thought']:
-                # If we ended in thought, yield as reasoning
-                yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': parse_state['buffer']}, 'finish_reason': None}]})}\n\n"
-            else:
-                # Yield as content
-                yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'content': parse_state['buffer']}, 'finish_reason': None}]})}\n\n"
+            # If buffer is not empty, it means we were waiting for delimiter and didn't find it.
+            # So it's all reasoning.
+            yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': parse_state['buffer']}, 'finish_reason': None}]})}\n\n"
 
         # Ensure the stream is properly terminated with [DONE]
         yield "data: [DONE]\n\n"
@@ -780,63 +774,41 @@ class VertexAIClient:
                                     if part.get('thought', False):
                                         delta['reasoning_content'] = text
                                     
-                                    # 2. Implicit Thought (Gemini 3 Pro) - Universal Title Support
-                                    elif state and "gemini-3-pro" in model and not state.get('finished_thinking'):
-                                        state['buffer'] += text
-                                        
-                                        # --- 阶段 1: 初始检测 ---
-                                        if state['first_chunk']:
-                                            if len(state['buffer']) < 5: 
-                                                continue
+                                    # 2. Implicit Thought (Gemini 3 Pro)
+                                    # Gemini 3 Pro Preview embeds thoughts in text, separated by **Response:**
+                                    elif state and "gemini-3-pro" in model:
+                                        if state.get('finished_thinking'):
+                                            delta['content'] = text
+                                        else:
+                                            state['buffer'] += text
+                                            delimiter = "**Response:**"
                                             
-                                            clean_buffer = state['buffer'].strip()
-                                            if clean_buffer.startswith('**'):
-                                                state['in_thought'] = True
-                                            else:
+                                            if delimiter in state['buffer']:
+                                                parts = state['buffer'].split(delimiter, 1)
+                                                thought_part = parts[0]
+                                                content_part = parts[1]
+                                                
+                                                if thought_part:
+                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': thought_part}, 'finish_reason': None}]})}\n\n"
+                                                
+                                                if content_part:
+                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'content': content_part}, 'finish_reason': None}]})}\n\n"
+                                                
                                                 state['finished_thinking'] = True
-                                                delta['content'] = state['buffer']
                                                 state['buffer'] = ""
-                                            
-                                            state['first_chunk'] = False
-                                        
-                                        # --- 阶段 2: 思维链流式处理 ---
-                                        if state['in_thought']:
-                                            import re
-                                            response_pattern = r'\n\s*\*\*Response:?\*\*'
-                                            match = re.search(response_pattern, state['buffer'], re.IGNORECASE)
-                                            
-                                            if match:
-                                                end_idx = match.start()
-                                                content_start_idx = match.end()
-                                                
-                                                thought_content = state['buffer'][:end_idx]
-                                                if thought_content:
-                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': thought_content}, 'finish_reason': None}]})}\n\n"
-                                                
-                                                real_content = state['buffer'][content_start_idx:].lstrip()
-                                                if real_content:
-                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'content': real_content}, 'finish_reason': None}]})}\n\n"
-                                                
-                                                state['buffer'] = ""
-                                                state['in_thought'] = False
-                                                state['finished_thinking'] = True
                                             else:
-                                                safe_threshold = 30
-                                                if len(state['buffer']) > safe_threshold:
-                                                    chunk_text = state['buffer'][:-safe_threshold]
-                                                    state['buffer'] = state['buffer'][-safe_threshold:]
-                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': chunk_text}, 'finish_reason': None}]})}\n\n"
-                                                continue
-                                        
-                                        # --- 阶段 3: 正文流式处理 ---
-                                        elif state['finished_thinking']:
-                                            delta['content'] = state['buffer']
-                                            state['buffer'] = ""
+                                                # Keep enough buffer for the delimiter
+                                                keep_len = len(delimiter) - 1
+                                                if len(state['buffer']) > keep_len:
+                                                    # Safe to yield the beginning
+                                                    to_yield = state['buffer'][:-keep_len]
+                                                    state['buffer'] = state['buffer'][-keep_len:]
+                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': to_yield}, 'finish_reason': None}]})}\n\n"
+                                            
+                                            continue # Don't yield delta at the end, we yielded manually
                                     
-                                    # 3. 普通文本
                                     else:
                                         delta['content'] = text
-
     
                                 # --- Image Part (inline data) ---
                                 inline_data = part.get('inlineData')
@@ -1194,11 +1166,4 @@ if __name__ == "__main__":
             gui.run(server_runner, stats_manager)
         except ImportError:
             print("⚠️ GUI dependencies not found or failed. Falling back to headless mode.")
-
             asyncio.run(main())
-
-
-
-
-
-
