@@ -432,6 +432,19 @@ class VertexAIClient:
                     "thinkingBudget": budget
                 }
                 print(f"ℹ️ Configured Thinking (Custom): Budget={budget}")
+
+            # Case 3: Gemini 3 Pro (or similar) without specific suffix/max_tokens, but we want to enable thoughts.
+            # Ensure includeThoughts is True for supported models as requested.
+            elif 'gemini-3-pro' in target_model:
+                 # Default to a reasonable budget if not specified, or just enable it.
+                 # Using 8192 as a safe default for "low" equivalent.
+                 budget = 8192
+                 gen_config['thinkingConfig'] = {
+                    "includeThoughts": True,
+                    "budget_token_count": budget,
+                    "thinkingBudget": budget
+                 }
+                 print(f"ℹ️ Configured Thinking (Auto-Enable): Budget={budget}")
             
             # Handle Resolution (Image Generation)
             if resolution_mode:
@@ -767,104 +780,25 @@ class VertexAIClient:
     
                             for part in parts:
                                 delta = {}
-                                # --- Text Part ---
-                                text = part.get('text', '')
-                                if text:
-                                    # 1. Explicit Thought (Legacy/Standard)
-                                    if part.get('thought', False):
-                                        delta['reasoning_content'] = text
-                                    
-                                    # 2. Implicit Thought (Gemini 3 Pro)
-                                    # Gemini 3 Pro Preview embeds thoughts in text.
-                                    # We look for explicit delimiters OR structural heuristics.
-                                    elif state and "gemini-3-pro" in model:
-                                        if state.get('finished_thinking'):
-                                            delta['content'] = text
-                                        else:
-                                            state['buffer'] += text
-                                            
-                                            # A. Check for explicit delimiters (Fast Path)
-                                            delimiters = ["**Response:**", "**Response**", "**Answer:**", "**Answer**"]
-                                            found_delimiter = None
-                                            split_idx = -1
-                                            
-                                            for d in delimiters:
-                                                idx = state['buffer'].find(d)
-                                                if idx != -1:
-                                                    found_delimiter = d
-                                                    split_idx = idx
-                                                    break
-                                            
-                                            if found_delimiter:
-                                                thought_part = state['buffer'][:split_idx]
-                                                # Skip the delimiter itself based on user instruction
-                                                content_part = state['buffer'][split_idx + len(found_delimiter):]
-                                                
-                                                if thought_part:
-                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': thought_part}, 'finish_reason': None}]})}\n\n"
-                                                
-                                                if content_part:
-                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'content': content_part}, 'finish_reason': None}]})}\n\n"
-                                                
-                                                state['finished_thinking'] = True
-                                                state['buffer'] = ""
-                                                continue
-
-                                            # B. Structural Heuristic: Detect transition from Thought to Response
-                                            # Thought steps are typically separated by \n\n and start with **Title**.
-                                            # If we find \n\n followed by text that is NOT a header, it's likely the response.
-                                            
-                                            while True:
-                                                # Find potential block separator
-                                                idx = state['buffer'].find('\n\n')
-                                                if idx == -1:
-                                                    break
-                                                    
-                                                # We have a separator. Check what follows.
-                                                # We need enough lookahead to determine if it's a header.
-                                                # Find the next newline after \n\n to get the full line
-                                                next_newline = state['buffer'].find('\n', idx + 2)
-                                                
-                                                # If we don't have a full line yet, and buffer isn't huge, wait for more data.
-                                                if next_newline == -1:
-                                                    if len(state['buffer']) - idx < 100: # Wait for up to 100 chars of lookahead
-                                                        break
-                                                    else:
-                                                        # If line is super long, it's probably not a header. Treat as response.
-                                                        next_line = state['buffer'][idx+2:]
-                                                else:
-                                                    next_line = state['buffer'][idx+2 : next_newline].strip()
-                                                
-                                                # Check if next_line looks like a header
-                                                # Header criteria: Starts with **, Ends with **, Short length
-                                                is_header = next_line.startswith('**') and next_line.endswith('**') and len(next_line) < 80
-                                                
-                                                if is_header:
-                                                    # It is a header. New Thought Step.
-                                                    # Yield everything up to idx+2 as reasoning.
-                                                    to_yield = state['buffer'][:idx+2]
-                                                    state['buffer'] = state['buffer'][idx+2:]
-                                                    yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': to_yield}, 'finish_reason': None}]})}\n\n"
-                                                    # Continue loop to find next block in the remaining buffer
-                                                else:
-                                                    # It is NOT a header. This is the Response.
-                                                    # Yield everything up to idx+2 as reasoning.
-                                                    thought_part = state['buffer'][:idx+2]
-                                                    content_part = state['buffer'][idx+2:]
-                                                    
-                                                    if thought_part:
-                                                        yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': thought_part}, 'finish_reason': None}]})}\n\n"
-                                                    
-                                                    if content_part:
-                                                        yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'content': content_part}, 'finish_reason': None}]})}\n\n"
-                                                    
-                                                    state['finished_thinking'] = True
-                                                    state['buffer'] = ""
-                                                    break # Exit loop
-                                            
-                                            continue
-                                    
-                                    else:
+                                
+                                # --- Handle Thought/Reasoning ---
+                                # Check for explicit thought field (new API behavior)
+                                is_thought = False
+                                thought_content = ""
+                                
+                                if 'thought' in part and part['thought']:
+                                    is_thought = True
+                                    if isinstance(part['thought'], str):
+                                        thought_content = part['thought']
+                                    elif part['thought'] is True and 'text' in part:
+                                        thought_content = part['text']
+                                
+                                if is_thought:
+                                    delta['reasoning_content'] = thought_content
+                                else:
+                                    # --- Text Part ---
+                                    text = part.get('text', '')
+                                    if text:
                                         delta['content'] = text
     
                                 # --- Image Part (inline data) ---
